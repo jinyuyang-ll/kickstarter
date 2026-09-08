@@ -37,3 +37,9 @@ smoke_test_results*.json
 *.log
 candidate_urls.csv
 .pytest_cache/
+
+# Local collection plans, per-query progress and test artifacts
+.collection/
+*.batches/
+artifacts/
+tabletop_urls.csv
