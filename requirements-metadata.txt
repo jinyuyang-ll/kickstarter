@@ -1,0 +1,6 @@
+curl_cffi==0.15.0
+lxml>=5.0
+pymysql>=1.1
+beautifulsoup4>=4.12
+requests>=2.31
+tls-client>=1.0

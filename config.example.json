@@ -1,0 +1,22 @@
+{
+  "db_config": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "replace-me",
+    "database": "kickstarter7"
+  },
+  "proxy_config": {
+    "proxy_host_list": [
+      "http-dynamic.xiaoxiangdaili.com",
+      "http-dynamic-S02.xiaoxiangdaili.com",
+      "http-dynamic-S03.xiaoxiangdaili.com",
+      "http-dynamic-S04.xiaoxiangdaili.com"
+    ],
+    "proxy_port": 10030,
+    "proxy_username": "",
+    "proxy_pwd": "",
+    "enable_proxy": 0
+  },
+  "max_threads": 1
+}

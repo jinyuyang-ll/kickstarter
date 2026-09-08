@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Kickstarter 采集控制台</title>
+  <style>
+    :root{--bg:#f5f7fb;--panel:#fff;--ink:#172033;--muted:#667085;--line:#e4e7ec;--green:#138a61;--red:#c33c54;--blue:#3157d5;--navy:#172554;--shadow:0 12px 36px rgba(23,32,51,.08)}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 Inter,"Microsoft YaHei",sans-serif}
+    header{background:linear-gradient(130deg,#101b40,#243c88);color:white;padding:28px max(24px,calc((100vw - 1280px)/2));display:flex;justify-content:space-between;gap:20px;align-items:end}
+    header h1{margin:0;font-size:28px;letter-spacing:-.5px} header p{margin:6px 0 0;color:#cbd5ff}.badge{background:#ffffff18;border:1px solid #ffffff30;border-radius:99px;padding:7px 12px;white-space:nowrap}
+    main{max-width:1280px;margin:24px auto;padding:0 24px 50px}.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}.step{background:white;border:1px solid var(--line);padding:13px 15px;border-radius:12px}.step b{display:block;color:var(--blue);font-size:12px}.step span{font-weight:700}
+    .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:20px}.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:20px;margin-bottom:20px}.card h2{margin:0 0 4px;font-size:18px}.hint{color:var(--muted);margin:0 0 18px}.form-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.wide{grid-column:1/-1}label{font-weight:650;font-size:13px}input,select{width:100%;border:1px solid #cfd5df;border-radius:9px;padding:10px 11px;margin-top:5px;background:white;color:var(--ink)}.checks{display:flex;gap:12px;flex-wrap:wrap;margin-top:7px}.checks label{font-weight:500}.checks input{width:auto;margin:0 5px 0 0}
+    button{border:0;border-radius:9px;padding:10px 15px;font-weight:750;cursor:pointer;background:var(--blue);color:white}button.secondary{background:#eef1ff;color:var(--blue)}button.dark{background:var(--navy)}button:disabled{opacity:.5;cursor:not-allowed}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}
+    .notice{padding:11px 13px;border-radius:10px;background:#fff8e6;border:1px solid #f5d98a;color:#74520a;margin-bottom:14px}.status{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{background:#f7f8fb;border-radius:10px;padding:12px}.metric b{display:block;font-size:21px}.metric span{color:var(--muted);font-size:12px}
+    .jobs{max-height:650px;overflow:auto}.job{border:1px solid var(--line);border-radius:11px;margin-top:10px;overflow:hidden}.job-head{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;background:#f8fafc}.pill{font-size:11px;font-weight:800;padding:3px 8px;border-radius:99px;background:#e9edf7}.pill.success{background:#dff5eb;color:#087451}.pill.failed{background:#fde5e9;color:#ad2741}.pill.running{background:#e6edff;color:#284bc1}pre{margin:0;padding:12px;background:#111827;color:#d7e1f5;white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;font:12px/1.5 Consolas,monospace}.files{font-size:12px;color:var(--muted);max-height:180px;overflow:auto}.file{display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0}
+    @media(max-width:900px){.grid{grid-template-columns:1fr}.steps{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){header{align-items:start;flex-direction:column}.form-grid,.steps,.status{grid-template-columns:1fr}.wide{grid-column:auto}}
+  </style>
+</head>
+<body>
+<header><div><h1>Kickstarter 采集控制台</h1><p>候选 URL 收集、检查、导入与批量采集的一站式本地界面</p></div><div class="badge" id="health">正在连接本地服务…</div></header>
+<main>
+  <div class="steps"><div class="step"><b>STEP 01</b><span>收集候选 URL</span></div><div class="step"><b>STEP 02</b><span>Dry-run 检查</span></div><div class="step"><b>STEP 03</b><span>导入 MySQL</span></div><div class="step"><b>STEP 04</b><span>3 → 10 → 50 采集</span></div></div>
+  <div class="grid"><section>
+    <div class="card"><h2>1. 收集项目 URL</h2><p class="hint">推荐粘贴浏览器当前 Discover 搜索地址；“最新”用于候选发现，年份以 launched_at 最终过滤。</p>
+      <div class="notice">“最新”适合增量和向后翻页，但不能证明多年历史严格全量；失败项目严格全量仍需额外授权数据源。</div>
+      <div class="form-grid">
+        <label class="wide">Discover / Search URL<input id="discover_url" value="https://www.kickstarter.com/discover/advanced?sort=newest"></label>
+        <label>关键词<input id="term" placeholder="可留空"></label><label>类别<select id="category"><option value="">全部类别</option><option value="12">Games</option><option value="16">Technology</option><option value="18">Publishing</option><option value="7">Design</option><option value="3">Comics</option><option value="1">Art</option><option value="11">Film & Video</option><option value="14">Music</option></select></label>
+        <label>年份（逗号分隔）<input id="years" placeholder="例如 2024,2025"></label><label>排序<select id="sort"><option value="newest">最新 Newest</option><option value="magic">Magic</option><option value="popularity">Popularity</option><option value="end_date">End date</option><option value="most_funded">Most funded</option></select></label>
+        <label>最多页数<input id="max_pages" type="number" min="1" max="500" value="3"></label><label>最多新增项目<input id="max_projects" type="number" min="0" value="50"></label>
+        <label>页间等待最少秒<input id="delay_min" type="number" min="0" value="8"></label><label>页间等待最多秒<input id="delay_max" type="number" min="0" value="15"></label>
+        <label class="wide">输出 CSV<input id="output" value="candidate_urls.csv"></label>
+        <div class="wide"><label>项目状态</label><div class="checks"><label><input type="checkbox" name="state" value="live" checked>Live</label><label><input type="checkbox" name="state" value="late_pledge">Late pledge</label><label><input type="checkbox" name="state" value="successful">Successful</label><label><input type="checkbox" name="state" value="failed">Failed</label><label><input type="checkbox" name="state" value="canceled">Canceled</label><label><input id="resume" type="checkbox">断点续跑</label></div></div>
+      </div><div class="actions"><button onclick="collectUrls()">开始低频收集</button><button class="secondary" onclick="runSimple('smoke',{})">运行 3 项目冒烟测试</button><button class="secondary" onclick="runSimple('proxy',{})">代理预检</button></div>
+    </div>
+    <div class="card"><h2>2. 检查与导入</h2><p class="hint">先 Dry-run；核对数量与 URL 后再正式导入任务队列。</p><div class="form-grid"><label class="wide">候选文件<input id="import_file" value="candidate_urls.csv"></label></div><div class="actions"><button class="secondary" onclick="importUrls(true)">Dry-run 检查</button><button class="dark" onclick="importUrls(false)">正式导入 MySQL</button></div></div>
+    <div class="card"><h2>3. 批量采集</h2><p class="hint">新来源严格按 3 → 10 → 50 扩大。年份留空表示不筛选。</p><div class="form-grid"><label>本轮数量<input id="batch_limit" type="number" min="1" value="3"></label><label>目标年份<input id="batch_year" type="number" placeholder="可留空"></label></div><div class="actions"><button onclick="batch(3)">先跑 3 条</button><button class="secondary" onclick="batch(10)">再跑 10 条</button><button class="secondary" onclick="batch(50)">再跑 50 条</button><button class="dark" onclick="batch()">按输入运行</button></div></div>
+  </section><aside>
+    <div class="card"><h2>运行状态</h2><div class="status"><div class="metric"><b id="jobTotal">0</b><span>任务数</span></div><div class="metric"><b id="jobRunning">0</b><span>运行中</span></div><div class="metric"><b id="jobFailed">0</b><span>失败</span></div></div></div>
+    <div class="card"><h2>任务日志</h2><p class="hint">状态和退出码来自实际脚本，不把历史结果当作本次结果。</p><div id="jobs" class="jobs"></div></div>
+    <div class="card"><h2>项目目录文件</h2><div id="files" class="files"></div></div>
+  </aside></div>
+</main>
+<script>
+const $=id=>document.getElementById(id); async function api(path,options={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const d=await r.json();if(!r.ok)throw new Error(d.error||r.statusText);return d}
+async function runSimple(kind,data){try{await api('/api/jobs/'+kind,{method:'POST',body:JSON.stringify(data)});await refresh()}catch(e){alert(e.message)}}
+function values(name){return [...document.querySelectorAll(`input[name="${name}"]:checked`)].map(x=>x.value)}
+async function collectUrls(){const data={discover_url:$('discover_url').value,term:$('term').value,category_id:$('category').value,years:$('years').value.split(',').map(x=>x.trim()).filter(Boolean),sort:$('sort').value,max_pages:$('max_pages').value,max_projects:$('max_projects').value,delay_min:$('delay_min').value,delay_max:$('delay_max').value,output:$('output').value,states:values('state'),resume:$('resume').checked};await runSimple('collect',data)}
+async function importUrls(dry){await runSimple('import',{file:$('import_file').value,dry_run:dry})} async function batch(force){await runSimple('batch',{limit:force||$('batch_limit').value,year:$('batch_year').value})}
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function refresh(){try{const [health,jobs]=await Promise.all([api('/api/health'),api('/api/jobs')]);$('health').textContent=`本地服务正常 · Python ${health.python}`;$('jobTotal').textContent=jobs.length;$('jobRunning').textContent=jobs.filter(x=>x.status==='running'||x.status==='queued').length;$('jobFailed').textContent=jobs.filter(x=>x.status==='failed').length;$('jobs').innerHTML=jobs.length?jobs.map(j=>`<div class="job"><div class="job-head"><b>${esc(j.kind)} · ${esc(j.id)}</b><span class="pill ${esc(j.status)}">${esc(j.status)}${j.exit_code===null?'':' · '+j.exit_code}</span></div><pre>${esc((j.log||[]).slice(-80).join('\n')||j.command.join(' '))}</pre></div>`).join(''):'<p class="hint">尚无任务</p>';$('files').innerHTML=health.files.slice(0,20).map(f=>`<div class="file"><span>${esc(f.name)}</span><span>${Math.ceil(f.size/1024)} KB</span></div>`).join('')}catch(e){$('health').textContent='本地服务异常 · '+e.message}}
+refresh();setInterval(refresh,2000);
+</script></body></html>
