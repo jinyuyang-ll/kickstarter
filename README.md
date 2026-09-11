@@ -2,7 +2,7 @@
 
 Python 编写的 Kickstarter 项目 URL 收集、项目元数据批量采集工具，附带本地 Web 控制台和 MySQL 存储支持。
 
-新版控制台支持地区、金额和筹款比例筛选，以及多状态分批采集、独立续跑和统一去重。详见 [分批采集指南](GUIDE_BATCH_COLLECTION.md) 与 [内测记录](TEST_REPORT_COLLECTION.md)。
+新版控制台支持地区、金额和筹款比例筛选，以及多状态分批采集、独立续跑和统一去重。G13 反馈修复增加了跨任务请求间隔、HTTP 错误分类和年份跳过统计，可继续使用上一版分批断点。详见 [分批采集指南](GUIDE_BATCH_COLLECTION.md) 与 [内测记录](TEST_REPORT_COLLECTION.md)。
 
 ## 本地运行（Windows PowerShell）
 

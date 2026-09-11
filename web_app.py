@@ -125,7 +125,7 @@ def collect_args(data):
         if str(year).strip():
             args += ["--year", str(int(year))]
     args += ["--max-projects", str(max(0, int(data.get("max_projects") or 0)))]
-    low, high = float(data.get("delay_min", 8)), float(data.get("delay_max", 15))
+    low, high = float(data.get("delay_min", 30)), float(data.get("delay_max", 60))
     if not all(math.isfinite(x) for x in (low, high)):
         raise ValueError("等待时间必须是有限数值")
     low = max(8, low)

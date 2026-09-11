@@ -24,6 +24,7 @@ from curl_cffi import requests
 
 from project_metadata_spider import build_proxy_url
 from url_importer import normalize_url
+from request_control import RequestGate, parse_retry_after
 
 
 BASE_URL = "https://www.kickstarter.com/discover/advanced.json"
@@ -51,7 +52,18 @@ STOP_LABELS = {'no_more_results': '本查询结果已结束', 'passed_requested_
 
 
 class CollectionError(RuntimeError):
-    pass
+    def __init__(self, message, **details):
+        super().__init__(message)
+        self.details = details
+
+
+ERROR_LABELS = {
+    "rate_limited": "HTTP 429：请求受限，已暂停后续批次",
+    "forbidden": "HTTP 403：访问被拒绝，需检查访问状态",
+    "verification_page": "收到 HTML 验证页面，已暂停后续批次",
+    "unexpected_response": "响应格式异常，进度已保存",
+    "retry_after_active": "尚未到服务端允许重试的时间，本次未发送请求",
+}
 
 
 def utc_iso(timestamp):
@@ -190,31 +202,57 @@ def project_to_row(project, source_url, page, collected_at):
 
 def request_page(session, url, proxy_url, timeout, retries):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    last_error = "unknown"
+    policy = getattr(session, "_collection_policy", None)
+    policy = policy if isinstance(policy, RequestGate) else None
+    last_error = CollectionError("unknown")
     for attempt in range(1, retries + 1):
+        if policy:
+            policy.before_request()
         try:
             response = session.get(
                 url,
                 headers={"accept": "application/json", "accept-language": "en-US,en;q=0.9"},
-                proxies=proxies,
-                timeout=timeout,
-                impersonate="chrome124",
+                proxies=proxies, timeout=timeout, impersonate="chrome124",
             )
+        except Exception as exc:
+            last_error = CollectionError(type(exc).__name__ + ": network request failed", kind="network_error")
+        else:
+            status = response.status_code
+            headers = getattr(response, "headers", {})
+            content_type = headers.get("content-type", "")
+            content_type = content_type if isinstance(content_type, str) else ""
+            retry_after = parse_retry_after(headers.get("retry-after"))
+            details = {"http_status": status, "content_type": content_type[:150]}
+            if retry_after is not None:
+                details["retry_after_seconds"] = retry_after
+                if policy and status != 200:
+                    details["retry_at"] = policy.defer(retry_after)
             text = (response.text or "")[:20000].lower()
-            challenged = response.status_code in (403, 429) or any(x in text for x in CHALLENGE_MARKERS)
-            if response.status_code == 200 and not challenged:
-                payload = response.json()
-                if not isinstance(payload, dict) or not isinstance(payload.get("projects"), list) or not isinstance(payload.get("has_more"), bool):
-                    raise ValueError("invalid_discover_payload")
-                return payload
-            last_error = "security_challenge" if challenged else f"http_{response.status_code}"
-            if challenged or response.status_code == 404:
-                break
-        except Exception as exc:  # network errors are intentionally bounded
-            last_error = f"{type(exc).__name__}: {exc}"
-        if attempt < retries:
+            looks_html = "text/html" in content_type.lower() or text.lstrip().startswith(("<!doctype html", "<html"))
+            if status == 200:
+                try:
+                    payload = response.json()
+                except (ValueError, TypeError):
+                    payload = None
+                # Parse valid listing JSON first: project text is not evidence of a challenge.
+                if isinstance(payload, dict) and isinstance(payload.get("projects"), list) and isinstance(payload.get("has_more"), bool):
+                    return payload
+            if looks_html and any(marker in text for marker in CHALLENGE_MARKERS):
+                kind = "verification_page"
+            elif status == 429:
+                kind = "rate_limited"
+            elif status == 403:
+                kind = "forbidden"
+            else:
+                kind = "unexpected_response"
+            details["kind"] = kind
+            message = "verification_page" if kind == "verification_page" else ("invalid_discover_payload" if status == 200 else f"http_{status}")
+            last_error = CollectionError(message, **details)
+            if status in (200, 403, 404, 429) or kind == "verification_page" or retry_after is not None:
+                raise last_error
+        if attempt < retries and not policy:
             time.sleep(min(20, 3 * (2 ** (attempt - 1))) + random.uniform(0, 1))
-    raise CollectionError(last_error)
+    raise last_error
 
 
 def write_json_atomic(path, value):
@@ -241,12 +279,15 @@ def collect_urls(args, progress=print):
     effective_sort = dict(parse_qsl(urlparse(build_query_url(args, 1)).query)).get("sort")
     proxy_url = proxy_from_config(load_config(args.config))
     session = requests.Session()
+    session._collection_policy = RequestGate(args.delay_min, args.delay_max, progress)
     new_count = pages_done = 0
     old_pages = int(saved.get("old_pages", 0))
     last_success = int(saved.get("last_success_page", 0))
     pending = saved.get("pending")
     reason = saved.get("stop_reason") if saved.get("complete") else "max_pages"
     error = None
+    error_details = {}
+    last_page_stats = saved.get("last_page_stats")
     total_hits = saved.get("total_hits")
 
     def persist():
@@ -256,7 +297,7 @@ def collect_urls(args, progress=print):
             "output": str(output), "rows": len(by_url), "pending": pending,
             "old_pages": old_pages, "last_success_page": last_success,
             "stop_reason": reason, "complete": reason in COMPLETE_REASONS,
-            "last_error": error, "total_hits": total_hits,
+            "last_error": error, "error_details": error_details, "last_page_stats": last_page_stats, "total_hits": total_hits,
             "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
         })
 
@@ -272,6 +313,8 @@ def collect_urls(args, progress=print):
                     raise CollectionError("empty_page_with_more_results")
             except Exception as exc:
                 error = str(exc)
+                error_details = getattr(exc, "details", {})
+                progress("REQUEST_ERROR " + json.dumps({"page": page, "error": error, **error_details}, ensure_ascii=False))
                 reason = "suspected_pagination_limit" if error == "http_404" and page > 1 and last_success == page - 1 else "request_failed"
                 persist()
                 break
@@ -280,15 +323,23 @@ def collect_urls(args, progress=print):
             collected_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
             page_years = list(payload.get("page_years", []))
             accepted = 0
+            skipped_year = skipped_invalid = skipped_duplicate = skipped_missing_year = 0
+            observed_years = {}
             remainder = []
             for index, project in enumerate(projects):
                 row = project_to_row(project, page_url, page, collected_at)
                 if not row:
+                    skipped_invalid += 1
                     continue
                 year = int(row["launched_year"]) if row["launched_year"].isdigit() else None
                 if year:
                     page_years.append(year)
+                    observed_years[str(year)] = observed_years.get(str(year), 0) + 1
                 if years and year not in years:
+                    if year is None:
+                        skipped_missing_year += 1
+                    else:
+                        skipped_year += 1
                     continue
                 if row["project_url"] not in by_url:
                     by_url[row["project_url"]] = row
@@ -297,8 +348,12 @@ def collect_urls(args, progress=print):
                     if args.max_projects and new_count >= args.max_projects:
                         remainder = projects[index + 1:]
                         break
+                else:
+                    skipped_duplicate += 1
             pages_done += 1
-            progress(f"PAGE_RESULT page={page} returned={len(projects)} accepted={accepted} total={len(by_url)}")
+            last_page_stats = {"page": page, "returned": len(projects), "accepted": accepted, "skipped_year": skipped_year, "skipped_missing_year": skipped_missing_year, "skipped_invalid_url": skipped_invalid, "skipped_duplicate": skipped_duplicate, "remaining": len(remainder), "observed_years": observed_years, "requested_years": sorted(years)}
+            progress(f"PAGE_RESULT page={page} returned={len(projects)} accepted={accepted} total={len(by_url)} skipped_year={skipped_year} skipped_missing_year={skipped_missing_year} skipped_invalid_url={skipped_invalid} skipped_duplicate={skipped_duplicate} remaining={len(remainder)}")
+            progress("PAGE_FILTER " + json.dumps(last_page_stats, ensure_ascii=False))
             if remainder:
                 # Persist the actual unprocessed records, not a fragile index in a changing live page.
                 pending = {"projects": remainder, "has_more": payload["has_more"], "page_years": page_years, "total_hits": total_hits}
@@ -319,15 +374,13 @@ def collect_urls(args, progress=print):
             persist()
             if reason in COMPLETE_REASONS or reason == "max_projects":
                 break
-            if pages_done < args.max_pages:
-                time.sleep(random.uniform(args.delay_min, args.delay_max))
     finally:
         session.close()
     summary = {
         "output": str(output), "pages_processed": pages_done, "new_urls": new_count,
         "total_urls": len(by_url), "next_page": page, "stop_reason": reason,
-        "stop_label": STOP_LABELS.get(reason, reason), "complete": reason in COMPLETE_REASONS,
-        "query_signature": signature, "error": error, "total_hits": total_hits,
+        "stop_label": ERROR_LABELS.get(error_details.get("kind"), STOP_LABELS.get(reason, reason)), "complete": reason in COMPLETE_REASONS,
+        "query_signature": signature, "error": error, "error_details": error_details, "last_page_stats": last_page_stats, "total_hits": total_hits,
     }
     progress("SUMMARY " + json.dumps(summary, ensure_ascii=False))
     return summary
@@ -401,8 +454,6 @@ def collect_plan(plan_path, progress=print):
         results.append({"id": item["id"], "label": item["label"], **result})
         write_csv_atomic(output, list(merged.values()))
         write_json_atomic(manifest_path, {"plan": str(plan_path), "batches": results, "total_urls": len(merged)})
-        if not halted and index + 1 < len(plan["batches"]):
-            time.sleep(random.uniform(args.delay_min, args.delay_max))
     summary = {"output": str(output), "manifest": str(manifest_path), "total_urls": len(merged), "batches": results, "complete": all(x["complete"] for x in results), "failed": any(x["stop_reason"] == "request_failed" for x in results)}
     write_json_atomic(manifest_path, summary)
     progress("PLAN_SUMMARY " + json.dumps(summary, ensure_ascii=False))
