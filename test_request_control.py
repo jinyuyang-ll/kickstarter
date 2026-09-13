@@ -1,5 +1,6 @@
 """Regression cases for G13 classification, cross-run pacing and year filtering."""
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,6 +47,27 @@ class ClassifierTests(unittest.TestCase):
             self.assertEqual(caught.exception.details["http_status"], status)
             self.assertEqual(session.get.call_count, 1)
 
+    def test_cloudflare_header_is_a_verification_page_and_starts_local_cooldown(self):
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as tmp, patch("request_control.time.time", side_effect=clock.time), patch("request_control.time.sleep", side_effect=clock.sleep):
+            gate = control.RequestGate(30, 30, lambda _: None, Path(tmp) / "gate.sqlite3")
+            session = Mock()
+            session.cookies.jar = []
+            session._collection_policy = gate
+            session._diagnostic_sink = None
+            session._diagnostic_secrets = []
+            session._challenge_cooldown_seconds = 3600
+            session.get.return_value = response(403, text="<html><title>Just a moment...</title></html>", headers={"content-type": "text/html", "cf-mitigated": "challenge"})
+            with self.assertRaises(c.CollectionError) as caught:
+                c.request_page(session, c.BASE_URL, None, 1, 1)
+            self.assertEqual(caught.exception.details["kind"], "verification_page")
+            self.assertEqual(caught.exception.details["local_cooldown_seconds"], 3600)
+            self.assertEqual(caught.exception.details["cooldown_source"], "local_safety_policy")
+            with self.assertRaises(control.CooldownActive) as blocked:
+                gate.before_request()
+            self.assertEqual(blocked.exception.details["kind"], "challenge_cooldown_active")
+            self.assertEqual(blocked.exception.details["cooldown_reason"], "cloudflare_challenge")
+            self.assertEqual(session.get.call_count, 1)
     def test_invalid_json_is_not_reported_as_success(self):
         session = Mock()
         session.get.return_value = response(payload={"message": "security check"})
@@ -65,6 +87,23 @@ class ClassifierTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def test_existing_gate_database_is_migrated_without_losing_timing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.sqlite3"
+            old_db = sqlite3.connect(path)
+            try:
+                old_db.execute("CREATE TABLE gate (id INTEGER PRIMARY KEY, last_start REAL NOT NULL, blocked_until REAL NOT NULL)")
+                old_db.execute("INSERT INTO gate VALUES (1, 123, 456)")
+                old_db.commit()
+            finally:
+                old_db.close()
+            gate = control.RequestGate(0, 0, lambda _: None, path)
+            db = gate.connect()
+            try:
+                row = db.execute("SELECT last_start, blocked_until, blocked_reason FROM gate WHERE id=1").fetchone()
+            finally:
+                db.close()
+            self.assertEqual(row, (123, 456, ""))
     def test_new_instance_obeys_previous_request_interval(self):
         clock = Clock()
         with tempfile.TemporaryDirectory() as tmp, patch("request_control.time.time", side_effect=clock.time), patch("request_control.time.sleep", side_effect=clock.sleep):
@@ -96,6 +135,16 @@ class GateTests(unittest.TestCase):
             clock.now += 121
             gate.before_request()
 
+    def test_shorter_new_cooldown_reports_the_existing_later_time(self):
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as tmp, patch("request_control.time.time", side_effect=clock.time):
+            gate = control.RequestGate(0, 0, lambda _: None, Path(tmp) / "gate.sqlite3")
+            later = gate.defer(3600, reason="cloudflare_challenge")
+            reported = gate.defer(60, reason="server_retry_after")
+            self.assertEqual(reported, later)
+            with self.assertRaises(control.CooldownActive) as blocked:
+                gate.before_request()
+            self.assertEqual(blocked.exception.details["kind"], "challenge_cooldown_active")
     def test_retry_after_seconds_and_http_date(self):
         self.assertEqual(control.parse_retry_after("120", now=1000), 120)
         self.assertEqual(control.parse_retry_after(formatdate(1120, usegmt=True), now=1000), 120)

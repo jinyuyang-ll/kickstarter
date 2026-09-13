@@ -11,9 +11,15 @@ GATE_PATH = Path(__file__).resolve().parent / ".collection" / "request_gate.sqli
 
 
 class CooldownActive(RuntimeError):
-    def __init__(self, until, now):
-        super().__init__("retry_after_active")
-        self.details = {"kind": "retry_after_active", "retry_at": until, "wait_seconds": math.ceil(until - now)}
+    def __init__(self, until, now, reason="server_retry_after"):
+        kind = "challenge_cooldown_active" if reason == "cloudflare_challenge" else "retry_after_active"
+        super().__init__(kind)
+        self.details = {
+            "kind": kind,
+            "retry_at": until,
+            "wait_seconds": math.ceil(until - now),
+            "cooldown_reason": reason,
+        }
 
 
 def parse_retry_after(value, now=None):
@@ -39,18 +45,21 @@ class RequestGate:
     def connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(self.path, timeout=10)
-        db.execute("CREATE TABLE IF NOT EXISTS gate (id INTEGER PRIMARY KEY, last_start REAL NOT NULL, blocked_until REAL NOT NULL)")
-        db.execute("INSERT OR IGNORE INTO gate VALUES (1, 0, 0)")
+        db.execute("CREATE TABLE IF NOT EXISTS gate (id INTEGER PRIMARY KEY, last_start REAL NOT NULL, blocked_until REAL NOT NULL, blocked_reason TEXT NOT NULL DEFAULT '')")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(gate)")}
+        if "blocked_reason" not in columns:
+            db.execute("ALTER TABLE gate ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''")
+        db.execute("INSERT OR IGNORE INTO gate (id, last_start, blocked_until, blocked_reason) VALUES (1, 0, 0, '')")
         db.commit()
         return db
 
     def before_request(self):
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            last, blocked = db.execute("SELECT last_start, blocked_until FROM gate WHERE id=1").fetchone()
+            last, blocked, reason = db.execute("SELECT last_start, blocked_until, blocked_reason FROM gate WHERE id=1").fetchone()
             now = time.time()
             if blocked > now:
-                raise CooldownActive(blocked, now)
+                raise CooldownActive(blocked, now, reason)
             ready = max(now, last + random.uniform(self.low, self.high))
             db.execute("UPDATE gate SET last_start=? WHERE id=1", (ready,))
         if ready > now:
@@ -59,12 +68,15 @@ class RequestGate:
             time.sleep(max(0, min(30, ready - time.time())))
         # A different process may have received Retry-After while this request waited.
         with closing(self.connect()) as db:
-            blocked = db.execute("SELECT blocked_until FROM gate WHERE id=1").fetchone()[0]
+            blocked, reason = db.execute("SELECT blocked_until, blocked_reason FROM gate WHERE id=1").fetchone()
         if blocked > time.time():
-            raise CooldownActive(blocked, time.time())
+            raise CooldownActive(blocked, time.time(), reason)
 
-    def defer(self, seconds):
+    def defer(self, seconds, reason="server_retry_after"):
         until = time.time() + seconds
         with closing(self.connect()) as db, db:
-            db.execute("UPDATE gate SET blocked_until=MAX(blocked_until, ?) WHERE id=1", (until,))
-        return until
+            current = db.execute("SELECT blocked_until FROM gate WHERE id=1").fetchone()[0]
+            if until >= current:
+                db.execute("UPDATE gate SET blocked_until=?, blocked_reason=? WHERE id=1", (until, reason))
+                return until
+            return current

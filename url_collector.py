@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import math
 import csv
 import datetime as dt
@@ -18,6 +19,7 @@ import random
 import sys
 import time
 import uuid
+from http.cookiejar import LoadError, MozillaCookieJar
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -45,7 +47,9 @@ CSV_FIELDS = (
     "source_page",
     "collected_at",
 )
-CHALLENGE_MARKERS = ("captcha", "verify you are human", "cf-chl-", "security check")
+CHALLENGE_MARKERS = ("captcha", "verify you are human", "cf-chl-", "security check", "just a moment")
+COOKIE_STORE_DIR = Path(__file__).resolve().parent / ".collection" / "session_state"
+CHALLENGE_COOLDOWN_SECONDS = 60 * 60
 
 
 RANGE_FIELDS = tuple(f"{kind}_{bound}" for kind in ("goal", "pledged", "raised") for bound in ("min", "max"))
@@ -65,6 +69,7 @@ ERROR_LABELS = {
     "verification_page": "收到 HTML 验证页面，已暂停后续批次",
     "unexpected_response": "响应格式异常，进度已保存",
     "retry_after_active": "尚未到服务端允许重试的时间，本次未发送请求",
+    "challenge_cooldown_active": "Cloudflare 验证冷却中，本次未发送请求",
 }
 
 
@@ -202,20 +207,98 @@ def project_to_row(project, source_url, page, collected_at):
     }
 
 
+def cookie_scope(proxy_url):
+    if not proxy_url:
+        return "direct"
+    parsed = urlparse(proxy_url)
+    endpoint = f"{parsed.scheme}|{parsed.hostname or ''}|{parsed.port or ''}"
+    return hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
+
+
+def kickstarter_cookies(session):
+    cookies = []
+    for cookie in session.cookies.jar:
+        domain = (cookie.domain or "").lstrip(".").lower()
+        if (domain == "kickstarter.com" or domain.endswith(".kickstarter.com")) and not cookie.is_expired():
+            cookies.append(cookie)
+    return cookies
+
+
+def kickstarter_cookie_count(session):
+    try:
+        return len(kickstarter_cookies(session))
+    except (AttributeError, TypeError):
+        return 0
+
+
 class CollectionTransport:
-    """One fixed configured proxy per plan; sessions optionally shared across batches."""
-    def __init__(self, config, mode="shared"):
+    """One proxy per plan, with task-local connections and persisted site cookies."""
+    def __init__(self, config, mode="shared", cookie_store_dir=None):
         if mode not in ("shared", "per_batch"):
             raise ValueError("无效连接模式")
         self.proxy_url = proxy_from_config(config)
         self.mode = mode
         self.secrets = diagnostics.configuration_secrets(config)
+        store = Path(cookie_store_dir) if cookie_store_dir is not None else COOKIE_STORE_DIR
+        self.cookie_path = store / ("kickstarter-" + cookie_scope(self.proxy_url) + ".txt") if mode == "shared" else None
+        self.cookie_state_status = "not_loaded" if self.cookie_path else "disabled"
+        self.restored_cookie_count = 0
         self.session = None
+
+    def _load_cookies(self, session):
+        if not self.cookie_path or not self.cookie_path.exists():
+            self.cookie_state_status = "empty" if self.cookie_path else "disabled"
+            return
+        jar = MozillaCookieJar(str(self.cookie_path))
+        try:
+            jar.load(ignore_discard=True, ignore_expires=False)
+            for cookie in jar:
+                domain = (cookie.domain or "").lstrip(".").lower()
+                if domain == "kickstarter.com" or domain.endswith(".kickstarter.com"):
+                    session.cookies.jar.set_cookie(copy.copy(cookie))
+            self.restored_cookie_count = len(kickstarter_cookies(session))
+            self.cookie_state_status = "restored"
+        except (LoadError, OSError):
+            self.cookie_state_status = "invalid"
+
+    def persist_cookies(self):
+        if not self.cookie_path or self.session is None:
+            return {"status": "disabled", "cookie_count": 0}
+        cookies = kickstarter_cookies(self.session)
+        if not cookies and not self.cookie_path.exists():
+            self.cookie_state_status = "empty"
+            return {"status": "empty", "cookie_count": 0}
+        self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.cookie_path.with_suffix(self.cookie_path.suffix + ".tmp")
+        jar = MozillaCookieJar(str(temporary))
+        for cookie in cookies:
+            jar.set_cookie(copy.copy(cookie))
+        try:
+            jar.save(ignore_discard=True, ignore_expires=False)
+            os.replace(temporary, self.cookie_path)
+            try:
+                os.chmod(self.cookie_path, 0o600)
+            except OSError:
+                pass
+            self.cookie_state_status = "saved"
+            return {"status": "saved", "cookie_count": len(cookies)}
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.cookie_state_status = "save_failed"
+            return {"status": "save_failed", "cookie_count": len(cookies)}
 
     def acquire(self):
         if self.session is None:
             self.session = requests.Session()
+            self._load_cookies(self.session)
             self.session._diagnostic_session_id = uuid.uuid4().hex[:12]
+            self.session._cookie_state_status = self.cookie_state_status
+            self.session._restored_cookie_count = self.restored_cookie_count
+            self.session._persist_cookie_state = self.persist_cookies
+            self.session._challenge_cooldown_seconds = CHALLENGE_COOLDOWN_SECONDS
         return self.session
 
     def release_batch(self):
@@ -243,7 +326,19 @@ def request_page(session, url, proxy_url, timeout, retries):
             policy.before_request()
         started_at = diagnostics.timestamp()
         started = time.monotonic()
-        request_info = {"requested_at": started_at, "request_url": diagnostics.safe_url(url), "attempt": attempt, "session_id": session_id, **diagnostics.network_context(proxy_url)}
+        cookie_state = getattr(session, "_cookie_state_status", "unknown")
+        cookie_state = cookie_state if isinstance(cookie_state, str) else "unknown"
+        restored_count = getattr(session, "_restored_cookie_count", 0)
+        restored_count = restored_count if isinstance(restored_count, int) else 0
+        request_info = {
+            "requested_at": started_at,
+            "request_url": diagnostics.safe_url(url),
+            "attempt": attempt,
+            "session_id": session_id,
+            "cookie_state": cookie_state,
+            "restored_cookie_count": restored_count,
+            **diagnostics.network_context(proxy_url),
+        }
         try:
             response = session.get(
                 url,
@@ -261,7 +356,13 @@ def request_page(session, url, proxy_url, timeout, retries):
             content_type = headers.get("content-type", "")
             content_type = content_type if isinstance(content_type, str) else ""
             retry_after = parse_retry_after(headers.get("retry-after"))
-            request_info.update(elapsed_ms=round((time.monotonic() - started) * 1000), http_status=status, content_type=content_type[:150], final_url=diagnostics.safe_url(getattr(response, "url", url)))
+            request_info.update(
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                http_status=status,
+                content_type=content_type[:150],
+                final_url=diagnostics.safe_url(getattr(response, "url", url)),
+                session_cookie_count=kickstarter_cookie_count(session),
+            )
             secrets = [*secret_values, *diagnostics.cookie_secrets(session)]
             details = dict(request_info)
             if retry_after is not None:
@@ -277,12 +378,24 @@ def request_page(session, url, proxy_url, timeout, retries):
                     payload = None
                 # Parse valid listing JSON first: project text is not evidence of a challenge.
                 if isinstance(payload, dict) and isinstance(payload.get("projects"), list) and isinstance(payload.get("has_more"), bool):
+                    success = {**request_info, "kind": "listing_json", "returned": len(payload["projects"]), "total_hits": payload.get("total_hits")}
+                    persist_cookie_state = getattr(session, "_persist_cookie_state", None)
+                    if callable(persist_cookie_state):
+                        success["cookie_state_save"] = persist_cookie_state()
                     if callable(sink):
-                        sink({**request_info, "kind": "listing_json", "returned": len(payload["projects"]), "total_hits": payload.get("total_hits")})
+                        sink(success)
                     return payload
             details.update(diagnostics.response_details(response, secrets))
-            if looks_html and any(marker in text for marker in CHALLENGE_MARKERS):
+            explicit_challenge = str(headers.get("cf-mitigated", "")).lower() == "challenge"
+            is_verification = explicit_challenge or (looks_html and any(marker in text for marker in CHALLENGE_MARKERS))
+            if is_verification:
                 kind = "verification_page"
+                if policy and retry_after is None:
+                    cooldown = getattr(session, "_challenge_cooldown_seconds", CHALLENGE_COOLDOWN_SECONDS)
+                    cooldown = cooldown if isinstance(cooldown, (int, float)) and cooldown >= 0 else CHALLENGE_COOLDOWN_SECONDS
+                    details["local_cooldown_seconds"] = cooldown
+                    details["cooldown_source"] = "local_safety_policy"
+                    details["retry_at"] = policy.defer(cooldown, reason="cloudflare_challenge")
             elif status == 429:
                 kind = "rate_limited"
             elif status == 403:
@@ -491,9 +604,11 @@ def collect_plan(plan_path, progress=print):
     selected = all_ids if selection is None else set(selection)
     if not selected or not selected <= all_ids:
         raise ValueError("请选择有效批次；筛选条件变化后请重新预览")
-    configs = {str(Path(build_parser().parse_args(item["args"]).config).resolve()) for item in plan["batches"] if item["id"] in selected}
+    selected_args = [build_parser().parse_args(item["args"]) for item in plan["batches"] if item["id"] in selected]
+    configs = {str(Path(args.config).resolve()) for args in selected_args}
     if len(configs) != 1:
         raise ValueError("同一计划须使用同一个网络配置文件")
+    request_settings = selected_args[0]
     output = Path(plan["output"])
     directory = output.parent / (output.stem + ".batches")
     directory.mkdir(parents=True, exist_ok=True)
@@ -507,7 +622,19 @@ def collect_plan(plan_path, progress=print):
     halted = False
     mode = plan.get("session_mode", "shared")
     transport = CollectionTransport(load_config(next(iter(configs))), mode)
-    progress("PLAN_SETTINGS " + json.dumps({"at": diagnostics.timestamp(), "batch_count": len(all_ids), "selected_count": len(selected), "session_mode": mode, **diagnostics.network_context(transport.proxy_url)}, ensure_ascii=False))
+    progress("PLAN_SETTINGS " + json.dumps({
+        "at": diagnostics.timestamp(),
+        "batch_count": len(all_ids),
+        "selected_count": len(selected),
+        "max_pages_per_batch": request_settings.max_pages,
+        "max_projects_per_batch": request_settings.max_projects,
+        "delay_min_seconds": request_settings.delay_min,
+        "delay_max_seconds": request_settings.delay_max,
+        "session_mode": mode,
+        "cookie_state_persistence": mode == "shared",
+        "challenge_cooldown_seconds": CHALLENGE_COOLDOWN_SECONDS,
+        **diagnostics.network_context(transport.proxy_url),
+    }, ensure_ascii=False))
     try:
         for index, item in enumerate(plan["batches"]):
             chosen = item["id"] in selected

@@ -64,6 +64,38 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(caught.exception.details['response_headers']['x-request-id'], 'test-id')
 
 
+class PersistentSessionTests(unittest.TestCase):
+    def test_successful_listing_persists_site_cookies_for_next_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = c.CollectionTransport({}, cookie_store_dir=tmp)
+            session = first.acquire()
+            session.cookies.set("fixture_session", "secret-cookie-value", domain=".kickstarter.com", path="/")
+            session.cookies.set("foreign_session", "foreign-secret", domain=".example.com", path="/")
+            session.get = Mock(return_value=response(payload={"projects": [], "has_more": False}))
+            records = []
+            session._diagnostic_sink = records.append
+            c.request_page(session, c.BASE_URL, None, 1, 1)
+            first.close()
+
+            self.assertEqual(records[0]["cookie_state_save"], {"status": "saved", "cookie_count": 1})
+            self.assertNotIn("secret-cookie-value", json.dumps(records))
+            self.assertNotIn("foreign-secret", first.cookie_path.read_text(encoding="utf-8"))
+            second = c.CollectionTransport({}, cookie_store_dir=tmp)
+            restored = second.acquire()
+            self.assertEqual(second.cookie_state_status, "restored")
+            self.assertEqual(second.restored_cookie_count, 1)
+            self.assertEqual(restored.cookies.get("fixture_session", domain=".kickstarter.com"), "secret-cookie-value")
+            self.assertIsNone(restored.cookies.get("foreign_session", domain=".example.com"))
+            second.close()
+
+    def test_per_batch_comparison_mode_does_not_persist_cookie_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = c.CollectionTransport({}, mode="per_batch", cookie_store_dir=tmp)
+            transport.acquire().cookies.set("fixture_session", "secret", domain=".kickstarter.com", path="/")
+            self.assertEqual(transport.persist_cookies()["status"], "disabled")
+            transport.close()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
 class SelectionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

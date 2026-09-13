@@ -1,5 +1,19 @@
 # 分批采集内测记录
 
+## Cloudflare 挑战跟进（2026-09-13）
+
+学弟提供的真实诊断显示：G12 第 3～5 页及 G13 第 1 页先后成功，跨页和跨批次间隔、任务内会话复用均生效；约 17 分钟后的新任务在第一个请求 G12 第 6 页收到 HTTP 403 HTML，响应含 `cf-mitigated: challenge`、`server: cloudflare` 和 `Just a moment...`。程序没有请求 G13～G16，G12 仍停在第 6 页，原汇总及所有断点保留。该证据排除了“5 组运行后才失败”和程序分页上限，但不能单独确定 Cloudflare 根据 IP、客户端特征、Cookie 还是其他因素作出判断。
+
+本轮运行完整测试套件，**65 项测试全部通过**。新增测试确认：
+
+- `cf-mitigated: challenge` 会被识别为验证页并创建 1 小时本地冷却；冷却中的新任务不发送请求。
+- 旧版三列 SQLite 请求间隔数据库可原位增加冷却原因字段，原时间状态不丢失。
+- 成功 JSON 响应后的 Kickstarter Cookie 可写入本地状态并由下一个任务恢复；其他域 Cookie 不保存，诊断不出现 Cookie 值。
+- 每批新建会话的对照模式不读取或写入跨任务 Cookie 状态，原有查询标识和断点不变。
+
+Cookie 测试使用临时目录和模拟响应，挑战测试使用可控时钟，不向 Kickstarter 发送请求。跨任务只能延续 Cookie，不能保留已结束子进程的 TCP / TLS 连接；因此该功能是减少会话重建差异，不是 Cloudflare 绕过措施，也不能承诺真实 403 消失。
+
+---
 ## 403 诊断、指定批次与会话比较（2026-09-13）
 
 运行 `python -m unittest test_url_collector test_collection_workflow test_request_control test_batch_diagnostics -q`，**60 项测试全部通过**，其中新增 13 项覆盖：
