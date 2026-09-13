@@ -17,6 +17,7 @@ import os
 import random
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -25,6 +26,7 @@ from curl_cffi import requests
 from project_metadata_spider import build_proxy_url
 from url_importer import normalize_url
 from request_control import RequestGate, parse_retry_after
+import request_diagnostics as diagnostics
 
 
 BASE_URL = "https://www.kickstarter.com/discover/advanced.json"
@@ -200,14 +202,48 @@ def project_to_row(project, source_url, page, collected_at):
     }
 
 
+class CollectionTransport:
+    """One fixed configured proxy per plan; sessions optionally shared across batches."""
+    def __init__(self, config, mode="shared"):
+        if mode not in ("shared", "per_batch"):
+            raise ValueError("无效连接模式")
+        self.proxy_url = proxy_from_config(config)
+        self.mode = mode
+        self.secrets = diagnostics.configuration_secrets(config)
+        self.session = None
+
+    def acquire(self):
+        if self.session is None:
+            self.session = requests.Session()
+            self.session._diagnostic_session_id = uuid.uuid4().hex[:12]
+        return self.session
+
+    def release_batch(self):
+        if self.mode == "per_batch":
+            self.close()
+
+    def close(self):
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+
+
 def request_page(session, url, proxy_url, timeout, retries):
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     policy = getattr(session, "_collection_policy", None)
     policy = policy if isinstance(policy, RequestGate) else None
+    sink = getattr(session, "_diagnostic_sink", None)
+    session_id = getattr(session, "_diagnostic_session_id", "")
+    session_id = session_id if isinstance(session_id, str) else ""
+    secret_values = getattr(session, "_diagnostic_secrets", ())
+    secret_values = secret_values if isinstance(secret_values, (list, tuple)) else ()
     last_error = CollectionError("unknown")
     for attempt in range(1, retries + 1):
         if policy:
             policy.before_request()
+        started_at = diagnostics.timestamp()
+        started = time.monotonic()
+        request_info = {"requested_at": started_at, "request_url": diagnostics.safe_url(url), "attempt": attempt, "session_id": session_id, **diagnostics.network_context(proxy_url)}
         try:
             response = session.get(
                 url,
@@ -215,14 +251,19 @@ def request_page(session, url, proxy_url, timeout, retries):
                 proxies=proxies, timeout=timeout, impersonate="chrome124",
             )
         except Exception as exc:
-            last_error = CollectionError(type(exc).__name__ + ": network request failed", kind="network_error")
+            request_info.update(elapsed_ms=round((time.monotonic() - started) * 1000), kind="network_error", exception_type=type(exc).__name__)
+            if callable(sink):
+                sink(request_info)
+            last_error = CollectionError(type(exc).__name__ + ": network request failed", **request_info)
         else:
             status = response.status_code
             headers = getattr(response, "headers", {})
             content_type = headers.get("content-type", "")
             content_type = content_type if isinstance(content_type, str) else ""
             retry_after = parse_retry_after(headers.get("retry-after"))
-            details = {"http_status": status, "content_type": content_type[:150]}
+            request_info.update(elapsed_ms=round((time.monotonic() - started) * 1000), http_status=status, content_type=content_type[:150], final_url=diagnostics.safe_url(getattr(response, "url", url)))
+            secrets = [*secret_values, *diagnostics.cookie_secrets(session)]
+            details = dict(request_info)
             if retry_after is not None:
                 details["retry_after_seconds"] = retry_after
                 if policy and status != 200:
@@ -236,7 +277,10 @@ def request_page(session, url, proxy_url, timeout, retries):
                     payload = None
                 # Parse valid listing JSON first: project text is not evidence of a challenge.
                 if isinstance(payload, dict) and isinstance(payload.get("projects"), list) and isinstance(payload.get("has_more"), bool):
+                    if callable(sink):
+                        sink({**request_info, "kind": "listing_json", "returned": len(payload["projects"]), "total_hits": payload.get("total_hits")})
                     return payload
+            details.update(diagnostics.response_details(response, secrets))
             if looks_html and any(marker in text for marker in CHALLENGE_MARKERS):
                 kind = "verification_page"
             elif status == 429:
@@ -246,6 +290,8 @@ def request_page(session, url, proxy_url, timeout, retries):
             else:
                 kind = "unexpected_response"
             details["kind"] = kind
+            if callable(sink):
+                sink(details)
             message = "verification_page" if kind == "verification_page" else ("invalid_discover_payload" if status == 200 else f"http_{status}")
             last_error = CollectionError(message, **details)
             if status in (200, 403, 404, 429) or kind == "verification_page" or retry_after is not None:
@@ -262,7 +308,7 @@ def write_json_atomic(path, value):
     os.replace(temp, path)
 
 
-def collect_urls(args, progress=print):
+def collect_urls(args, progress=print, transport=None):
     output = Path(args.output).resolve()
     checkpoint = Path(args.checkpoint or (str(output) + ".checkpoint.json"))
     signature = query_signature(args)
@@ -277,9 +323,13 @@ def collect_urls(args, progress=print):
     by_url = {row["project_url"]: row for row in load_existing(output) if row.get("project_url")}
     years = set(args.years or [])
     effective_sort = dict(parse_qsl(urlparse(build_query_url(args, 1)).query)).get("sort")
-    proxy_url = proxy_from_config(load_config(args.config))
-    session = requests.Session()
+    owns_transport = transport is None
+    transport = transport or CollectionTransport(load_config(args.config))
+    proxy_url = transport.proxy_url
+    session = transport.acquire()
     session._collection_policy = RequestGate(args.delay_min, args.delay_max, progress)
+    session._diagnostic_secrets = transport.secrets
+    session._diagnostic_sink = lambda record: progress("REQUEST_DIAGNOSTIC " + json.dumps(record, ensure_ascii=False))
     new_count = pages_done = 0
     old_pages = int(saved.get("old_pages", 0))
     last_success = int(saved.get("last_success_page", 0))
@@ -304,8 +354,10 @@ def collect_urls(args, progress=print):
     try:
         while not saved.get("complete") and pages_done < args.max_pages:
             page_url = build_query_url(args, page)
-            progress(f"PAGE [{pages_done + 1}/{args.max_pages}] {page_url}")
+            progress(f"PAGE [{pages_done + 1}/{args.max_pages}] {diagnostics.safe_url(page_url)}")
             try:
+                if pending is not None:
+                    progress("CACHE_RESUME " + json.dumps({"at": diagnostics.timestamp(), "page": page, "remaining": len(pending["projects"]), "network_request": False}))
                 payload = pending if pending is not None else request_page(session, page_url, proxy_url, args.timeout, args.retries)
                 if not isinstance(payload, dict) or not isinstance(payload.get("projects"), list) or not isinstance(payload.get("has_more"), bool):
                     raise CollectionError("invalid_discover_payload")
@@ -375,7 +427,10 @@ def collect_urls(args, progress=print):
             if reason in COMPLETE_REASONS or reason == "max_projects":
                 break
     finally:
-        session.close()
+        if owns_transport:
+            transport.close()
+        else:
+            transport.release_batch()
     summary = {
         "output": str(output), "pages_processed": pages_done, "new_urls": new_count,
         "total_urls": len(by_url), "next_page": page, "stop_reason": reason,
@@ -420,41 +475,65 @@ def search_locations(term, config_path="config.json"):
         return locations
 
 
+def batch_snapshot(item, directory):
+    part = directory / (item["id"] + ".csv")
+    checkpoint = Path(str(part) + ".checkpoint.json")
+    saved = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
+    valid = saved.get("query_signature") == item["id"] and (not saved.get("rows") or part.exists())
+    return {"complete": bool(valid and saved.get("complete")), "next_page": saved.get("next_page", 1), "total_urls": len(load_existing(part)), "previous_stop_reason": saved.get("stop_reason"), "last_page_stats": saved.get("last_page_stats")}
+
+
 def collect_plan(plan_path, progress=print):
     plan_path = Path(plan_path).resolve()
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    all_ids = {item["id"] for item in plan["batches"]}
+    selection = plan.get("selected_batch_ids")
+    selected = all_ids if selection is None else set(selection)
+    if not selected or not selected <= all_ids:
+        raise ValueError("请选择有效批次；筛选条件变化后请重新预览")
+    configs = {str(Path(build_parser().parse_args(item["args"]).config).resolve()) for item in plan["batches"] if item["id"] in selected}
+    if len(configs) != 1:
+        raise ValueError("同一计划须使用同一个网络配置文件")
     output = Path(plan["output"])
     directory = output.parent / (output.stem + ".batches")
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "manifest.json"
     results = []
-    merged = {}
-    # Only merge files belonging to this plan, never unrelated old queries.
+    # Selection never narrows the accumulated output; all existing URLs are retained.
+    merged = {row["project_url"]: row for row in load_existing(output) if row.get("project_url")}
     for item in plan["batches"]:
-        part = directory / (item["id"] + ".csv")
-        for row in load_existing(part):
+        for row in load_existing(directory / (item["id"] + ".csv")):
             merged[row["project_url"]] = row
     halted = False
-    for index, item in enumerate(plan["batches"]):
-        args = build_parser().parse_args(item["args"])
-        args.output = str(directory / (item["id"] + ".csv"))
-        args.resume = True
-        args.checkpoint = None
-        if halted:
-            result = {"complete": False, "stop_reason": "not_run", "stop_label": "上个批次请求失败，本批次未运行"}
-        else:
-            progress(f"BATCH {index + 1}/{len(plan['batches'])} {item['label']}")
-            try:
-                result = collect_urls(args, progress)
-            except Exception as exc:
-                result = {"complete": False, "stop_reason": "request_failed", "stop_label": "请求或断点失败", "error": str(exc)}
-            halted = result["stop_reason"] == "request_failed"
-            for row in load_existing(Path(args.output)):
-                merged[row["project_url"]] = row
-        results.append({"id": item["id"], "label": item["label"], **result})
-        write_csv_atomic(output, list(merged.values()))
-        write_json_atomic(manifest_path, {"plan": str(plan_path), "batches": results, "total_urls": len(merged)})
-    summary = {"output": str(output), "manifest": str(manifest_path), "total_urls": len(merged), "batches": results, "complete": all(x["complete"] for x in results), "failed": any(x["stop_reason"] == "request_failed" for x in results)}
+    mode = plan.get("session_mode", "shared")
+    transport = CollectionTransport(load_config(next(iter(configs))), mode)
+    progress("PLAN_SETTINGS " + json.dumps({"at": diagnostics.timestamp(), "batch_count": len(all_ids), "selected_count": len(selected), "session_mode": mode, **diagnostics.network_context(transport.proxy_url)}, ensure_ascii=False))
+    try:
+        for index, item in enumerate(plan["batches"]):
+            chosen = item["id"] in selected
+            args = build_parser().parse_args(item["args"])
+            args.output = str(directory / (item["id"] + ".csv"))
+            args.resume = True
+            args.checkpoint = None
+            executed = False
+            if not chosen or halted:
+                result = {**batch_snapshot(item, directory), "stop_reason": "not_selected" if not chosen else "not_run", "stop_label": "本轮未选择，原进度保留" if not chosen else "上个批次请求失败，本批次未运行"}
+            else:
+                progress(f"BATCH {index + 1}/{len(plan['batches'])} {item['label']}")
+                executed = True
+                try:
+                    result = collect_urls(args, progress, transport=transport)
+                except Exception as exc:
+                    result = {"complete": False, "stop_reason": "request_failed", "stop_label": "请求或断点失败", "error": type(exc).__name__ if not isinstance(exc, CollectionError) else str(exc)}
+                halted = result["stop_reason"] == "request_failed"
+                for row in load_existing(Path(args.output)):
+                    merged[row["project_url"]] = row
+            results.append({"id": item["id"], "label": item["label"], "selected": chosen, "executed": executed, **result})
+            write_csv_atomic(output, list(merged.values()))
+            write_json_atomic(manifest_path, {"plan": str(plan_path), "batches": results, "total_urls": len(merged)})
+    finally:
+        transport.close()
+    summary = {"output": str(output), "manifest": str(manifest_path), "session_mode": mode, "total_urls": len(merged), "batches": results, "complete": all(x["complete"] for x in results), "selected_complete": all(x["complete"] for x in results if x["selected"]), "failed": any(x["executed"] and x["stop_reason"] == "request_failed" for x in results)}
     write_json_atomic(manifest_path, summary)
     progress("PLAN_SUMMARY " + json.dumps(summary, ensure_ascii=False))
     return summary

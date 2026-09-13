@@ -41,7 +41,7 @@ def safe_workspace_file(value, suffixes=None):
 
 
 def public_job(job):
-    return {k: v for k, v in job.items() if k != "process"}
+    return {k: v for k, v in job.items() if k not in ("process", "log_path")}
 
 
 def run_job(job_id, command):
@@ -49,6 +49,13 @@ def run_job(job_id, command):
         job = JOBS[job_id]
         job["status"] = "running"
         job["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    log_path = ROOT / ".collection" / "job_logs" / (job_id + ".txt") if job["kind"] == "collect" else None
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("JOB_STARTED " + json.dumps({"job_id": job_id, "at": collector.diagnostics.timestamp()}, ensure_ascii=False) + "\n", encoding="utf-8")
+        with LOCK:
+            job["log_path"] = str(log_path)
+            job["diagnostics_url"] = f"/api/jobs/{job_id}/diagnostics"
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     try:
@@ -70,6 +77,9 @@ def run_job(job_id, command):
     with LOCK:
         job["process"] = process
     for line in process.stdout:
+        if log_path:
+            with log_path.open("a", encoding="utf-8") as output:
+                output.write(line)
         with LOCK:
             job["log"].append(line.rstrip())
             if line.startswith(("SUMMARY ", "PLAN_SUMMARY ")):
@@ -79,6 +89,9 @@ def run_job(job_id, command):
                     pass
             job["log"] = job["log"][-1000:]
     code = process.wait()
+    if log_path:
+        with log_path.open("a", encoding="utf-8") as output:
+            output.write("JOB_FINISHED " + json.dumps({"at": collector.diagnostics.timestamp(), "exit_code": code}) + "\n")
     with LOCK:
         job["exit_code"] = code
         job["status"] = "success" if code == 0 else ("partial" if code == 3 and job["kind"] == "collect" else "failed")
@@ -175,7 +188,15 @@ def make_plan(data):
             batches[identity] = {"id": identity, "label": label, "url": url, "years": args.years or [], "args": argv}
     if len(batches) > 200:
         raise ValueError("一次计划最多 200 个批次，请减少条件")
-    return {"version": 1, "output": str(output), "batches": list(batches.values())}
+    selection = data.get("selected_batch_ids")
+    if selection is not None:
+        if not isinstance(selection, list) or not selection or any(not isinstance(item, str) or item not in batches for item in selection):
+            raise ValueError("请选择有效批次；条件有变化时请重新预览")
+        selection = list(dict.fromkeys(selection))
+    mode = data.get("session_mode", "shared")
+    if mode not in ("shared", "per_batch"):
+        raise ValueError("无效连接模式")
+    return {"version": 2, "output": str(output), "batches": list(batches.values()), "selected_batch_ids": selection, "session_mode": mode}
 
 
 def cached_locations(term):
@@ -228,6 +249,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/diagnostics"):
+            identity = parsed.path.split("/")[-2]
+            if not identity or any(char not in "0123456789abcdef" for char in identity) or len(identity) != 10:
+                self.send_json({"error": "无效任务编号"}, 400)
+                return
+            path = ROOT / ".collection" / "job_logs" / (identity + ".txt")
+            if not path.is_file():
+                self.send_json({"error": "诊断日志尚未生成"}, 404)
+                return
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="collection-{identity}.txt"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == "/api/locations":
             try:
                 term = parse_qs(parsed.query).get("term", [""])[0].strip()
