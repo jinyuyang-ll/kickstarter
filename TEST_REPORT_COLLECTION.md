@@ -1,5 +1,15 @@
 # 分批采集内测记录
 
+## 可见 Edge 浏览器模式（2026-09-16）
+
+针对“同一 G12 第 6 页 JSON 在普通浏览器正常、直接 HTTP 首次请求收到 Cloudflare 验证”的对照结果，本轮新增可见 Edge 浏览器采集模式。控制台默认选择该模式和整轮复用会话；直接 HTTP 模式保留用于诊断。
+
+完整离线套件 **70 项测试全部通过**。新增 5 项覆盖浏览器计划默认值、Discover JSON 结构校验、代理参数转换、成功响应脱敏诊断，以及验证页面提示一次后继续解析 JSON。原有 65 项断点、筛选、Cookie、冷却、批次选择和日志测试全部继续通过。
+
+另使用本机 Microsoft Edge 访问 127.0.0.1 临时 JSON 服务进行真实浏览器链路测试，确认专用持久配置能够启动和关闭，页面 JSON 被正确解析为一个项目，诊断标记为 `request_mode=browser`；该测试未访问 Kickstarter。控制台页面也通过本机 Edge 检查，默认显示“可见 Edge 浏览器（推荐）”和“整轮复用会话”，人工验证及本地配置提示可见，截图为 `artifacts/browser-mode-ui.png`。
+
+浏览器配置目录位于被 Git 忽略的 `.collection/browser_profiles/`。代码和测试未输出配置路径、Cookie 值或页面正文。语法检查及 `git diff --check` 均通过。
+
 ## Cloudflare 挑战跟进（2026-09-13）
 
 学弟提供的真实诊断显示：G12 第 3～5 页及 G13 第 1 页先后成功，跨页和跨批次间隔、任务内会话复用均生效；约 17 分钟后的新任务在第一个请求 G12 第 6 页收到 HTTP 403 HTML，响应含 `cf-mitigated: challenge`、`server: cloudflare` 和 `Just a moment...`。程序没有请求 G13～G16，G12 仍停在第 6 页，原汇总及所有断点保留。该证据排除了“5 组运行后才失败”和程序分页上限，但不能单独确定 Cloudflare 根据 IP、客户端特征、Cookie 还是其他因素作出判断。

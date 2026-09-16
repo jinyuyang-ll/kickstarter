@@ -114,7 +114,10 @@ def start_job(kind, args):
 
 def collect_args(data):
     output = safe_workspace_file(data.get("output") or "candidate_urls.csv", {".csv"})
-    args = ["--output", str(output), "--max-pages", str(max(1, min(500, int(data.get("max_pages", 3)))))]
+    request_mode = data.get("request_mode", "browser")
+    if request_mode not in ("http", "browser"):
+        raise ValueError("无效请求模式")
+    args = ["--output", str(output), "--max-pages", str(max(1, min(500, int(data.get("max_pages", 3))))), "--request-mode", request_mode]
     if data.get("discover_url"):
         args += ["--discover-url", str(data["discover_url"])]
     for attr in ("term", "sort"):
@@ -154,7 +157,7 @@ def collect_args(data):
         parsed.states = states
     canonical = collector.build_query_url(parsed, 1)
     # Canonical URL owns all filters; only execution options and years stay separate.
-    result = ["--discover-url", canonical, "--output", str(output), "--max-pages", str(parsed.max_pages), "--max-projects", str(parsed.max_projects), "--delay-min", str(low), "--delay-max", str(high)]
+    result = ["--discover-url", canonical, "--output", str(output), "--max-pages", str(parsed.max_pages), "--max-projects", str(parsed.max_projects), "--delay-min", str(low), "--delay-max", str(high), "--request-mode", parsed.request_mode]
     for year in parsed.years or []:
         result += ["--year", str(year)]
     if parsed.resume:
@@ -196,7 +199,10 @@ def make_plan(data):
     mode = data.get("session_mode", "shared")
     if mode not in ("shared", "per_batch"):
         raise ValueError("无效连接模式")
-    return {"version": 2, "output": str(output), "batches": list(batches.values()), "selected_batch_ids": selection, "session_mode": mode}
+    request_mode = data.get("request_mode", "browser")
+    if request_mode not in ("http", "browser"):
+        raise ValueError("无效请求模式")
+    return {"version": 3, "output": str(output), "batches": list(batches.values()), "selected_batch_ids": selection, "session_mode": mode, "request_mode": request_mode}
 
 
 def cached_locations(term):

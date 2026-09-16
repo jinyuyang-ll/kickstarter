@@ -23,6 +23,7 @@ def args_for(tmp, **overrides):
         delay_max=0,
         timeout=1,
         retries=1,
+        request_mode="http",
         stop_after_old_pages=2,
         output=str(Path(tmp) / "candidate.csv"),
         checkpoint=None,

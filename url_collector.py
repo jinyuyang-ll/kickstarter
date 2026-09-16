@@ -21,7 +21,7 @@ import time
 import uuid
 from http.cookiejar import LoadError, MozillaCookieJar
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 from curl_cffi import requests
 
@@ -49,6 +49,7 @@ CSV_FIELDS = (
 )
 CHALLENGE_MARKERS = ("captcha", "verify you are human", "cf-chl-", "security check", "just a moment")
 COOKIE_STORE_DIR = Path(__file__).resolve().parent / ".collection" / "session_state"
+BROWSER_PROFILE_DIR = Path(__file__).resolve().parent / ".collection" / "browser_profiles"
 CHALLENGE_COOLDOWN_SECONDS = 60 * 60
 
 
@@ -70,6 +71,8 @@ ERROR_LABELS = {
     "unexpected_response": "响应格式异常，进度已保存",
     "retry_after_active": "尚未到服务端允许重试的时间，本次未发送请求",
     "challenge_cooldown_active": "Cloudflare 验证冷却中，本次未发送请求",
+    "browser_verification_timeout": "浏览器验证等待超时，进度已保存",
+    "browser_closed": "浏览器窗口已关闭，进度已保存",
 }
 
 
@@ -231,16 +234,109 @@ def kickstarter_cookie_count(session):
         return 0
 
 
+def browser_proxy(proxy_url):
+    """Translate the configured proxy URL to Playwright without logging secrets."""
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    if not parsed.scheme or not parsed.hostname:
+        raise CollectionError("invalid_proxy_url")
+    server = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        server += f":{parsed.port}"
+    result = {"server": server}
+    if parsed.username:
+        result["username"] = unquote(parsed.username)
+    if parsed.password:
+        result["password"] = unquote(parsed.password)
+    return result
+
+
+def browser_json_payload(text):
+    """Return a Discover listing payload rendered by the browser, if present."""
+    try:
+        payload = json.loads((text or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("projects"), list) and isinstance(payload.get("has_more"), bool):
+        return payload
+    return None
+
+
+class BrowserSession:
+    """Visible, persistent Edge session; a user can complete a site verification."""
+    def __init__(self, profile_path, proxy_url=None, verification_timeout=300, headless=False):
+        self.profile_path = Path(profile_path)
+        self.proxy_url = proxy_url
+        self.verification_timeout = max(30, int(verification_timeout))
+        self.headless = headless
+        self._playwright = self.context = self.page = None
+        self._diagnostic_session_id = uuid.uuid4().hex[:12]
+        self._challenge_cooldown_seconds = CHALLENGE_COOLDOWN_SECONDS
+
+    def start(self):
+        if self.context is not None:
+            return self
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise CollectionError("browser_dependency_missing: 请运行 pip install -r requirements-metadata.txt") from exc
+        self.profile_path.mkdir(parents=True, exist_ok=True)
+        self._playwright = sync_playwright().start()
+        options = {
+            "user_data_dir": str(self.profile_path),
+            "channel": "msedge",
+            "headless": self.headless,
+            "args": ["--no-first-run", "--no-default-browser-check"],
+        }
+        proxy = browser_proxy(self.proxy_url)
+        if proxy:
+            options["proxy"] = proxy
+        try:
+            self.context = self._playwright.chromium.launch_persistent_context(**options)
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        except Exception as exc:
+            self.close()
+            raise CollectionError("browser_start_failed", kind="browser_closed", exception_type=type(exc).__name__) from exc
+        return self
+
+    def cookie_count(self):
+        try:
+            return sum(1 for item in self.context.cookies() if (item.get("domain") or "").lstrip(".").endswith("kickstarter.com"))
+        except Exception:
+            return 0
+
+    def close(self):
+        context, playwright = self.context, self._playwright
+        self.context = self.page = self._playwright = None
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
 class CollectionTransport:
     """One proxy per plan, with task-local connections and persisted site cookies."""
-    def __init__(self, config, mode="shared", cookie_store_dir=None):
+    def __init__(self, config, mode="shared", cookie_store_dir=None, request_mode="http", browser_profile_dir=None, browser_headless=False):
         if mode not in ("shared", "per_batch"):
             raise ValueError("无效连接模式")
+        if request_mode not in ("http", "browser"):
+            raise ValueError("无效请求模式")
         self.proxy_url = proxy_from_config(config)
         self.mode = mode
+        self.request_mode = request_mode
+        self.browser_headless = browser_headless
         self.secrets = diagnostics.configuration_secrets(config)
         store = Path(cookie_store_dir) if cookie_store_dir is not None else COOKIE_STORE_DIR
-        self.cookie_path = store / ("kickstarter-" + cookie_scope(self.proxy_url) + ".txt") if mode == "shared" else None
+        self.cookie_path = store / ("kickstarter-" + cookie_scope(self.proxy_url) + ".txt") if mode == "shared" and request_mode == "http" else None
+        profiles = Path(browser_profile_dir) if browser_profile_dir is not None else BROWSER_PROFILE_DIR
+        self.browser_profile_path = profiles / ("kickstarter-" + cookie_scope(self.proxy_url))
         self.cookie_state_status = "not_loaded" if self.cookie_path else "disabled"
         self.restored_cookie_count = 0
         self.session = None
@@ -292,13 +388,16 @@ class CollectionTransport:
 
     def acquire(self):
         if self.session is None:
-            self.session = requests.Session()
-            self._load_cookies(self.session)
-            self.session._diagnostic_session_id = uuid.uuid4().hex[:12]
-            self.session._cookie_state_status = self.cookie_state_status
-            self.session._restored_cookie_count = self.restored_cookie_count
-            self.session._persist_cookie_state = self.persist_cookies
-            self.session._challenge_cooldown_seconds = CHALLENGE_COOLDOWN_SECONDS
+            if self.request_mode == "browser":
+                self.session = BrowserSession(self.browser_profile_path, self.proxy_url, headless=self.browser_headless).start()
+            else:
+                self.session = requests.Session()
+                self._load_cookies(self.session)
+                self.session._diagnostic_session_id = uuid.uuid4().hex[:12]
+                self.session._cookie_state_status = self.cookie_state_status
+                self.session._restored_cookie_count = self.restored_cookie_count
+                self.session._persist_cookie_state = self.persist_cookies
+                self.session._challenge_cooldown_seconds = CHALLENGE_COOLDOWN_SECONDS
         return self.session
 
     def release_batch(self):
@@ -312,6 +411,8 @@ class CollectionTransport:
 
 
 def request_page(session, url, proxy_url, timeout, retries):
+    if isinstance(session, BrowserSession):
+        return request_browser_page(session, url, timeout)
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     policy = getattr(session, "_collection_policy", None)
     policy = policy if isinstance(policy, RequestGate) else None
@@ -414,6 +515,108 @@ def request_page(session, url, proxy_url, timeout, retries):
     raise last_error
 
 
+def request_browser_page(session, url, timeout):
+    """Navigate Edge to the JSON URL and wait for any user-completed verification."""
+    policy = getattr(session, "_collection_policy", None)
+    policy = policy if isinstance(policy, RequestGate) else None
+    sink = getattr(session, "_diagnostic_sink", None)
+    progress = getattr(session, "_collection_progress", None)
+    if policy:
+        policy.before_request()
+    started_at = diagnostics.timestamp()
+    started = time.monotonic()
+    request_info = {
+        "requested_at": started_at,
+        "request_url": diagnostics.safe_url(url),
+        "attempt": 1,
+        "session_id": session._diagnostic_session_id,
+        "request_mode": "browser",
+        "browser_profile": "persistent",
+        **diagnostics.network_context(session.proxy_url),
+    }
+    response = None
+    try:
+        response = session.page.goto(url, wait_until="domcontentloaded", timeout=max(1, timeout) * 1000)
+    except Exception as exc:
+        # A challenge can outlive the navigation timeout; inspect the open page before failing.
+        if session.page is None or session.page.is_closed():
+            details = {**request_info, "kind": "browser_closed", "exception_type": type(exc).__name__}
+            if callable(sink):
+                sink(details)
+            raise CollectionError("browser_closed", **details) from exc
+    initial_status = response.status if response is not None else None
+    initial_headers = response.headers if response is not None else {}
+    deadline = time.monotonic() + session.verification_timeout
+    action_reported = False
+    while True:
+        try:
+            rendered_text = session.page.locator("body").inner_text(timeout=2000)
+        except Exception as exc:
+            if session.page is None or session.page.is_closed():
+                details = {**request_info, "kind": "browser_closed", "exception_type": type(exc).__name__}
+                if callable(sink):
+                    sink(details)
+                raise CollectionError("browser_closed", **details) from exc
+            rendered_text = ""
+        payload = browser_json_payload(rendered_text)
+        if payload is not None:
+            success = {
+                **request_info,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "http_status": 200,
+                "content_type": "application/json",
+                "final_url": diagnostics.safe_url(session.page.url),
+                "session_cookie_count": session.cookie_count(),
+                "kind": "listing_json",
+                "returned": len(payload["projects"]),
+                "total_hits": payload.get("total_hits"),
+            }
+            if callable(sink):
+                sink(success)
+            return payload
+        try:
+            rendered_title = session.page.title()
+        except Exception:
+            rendered_title = ""
+        challenge_text = (rendered_title + "\n" + rendered_text[:20000]).lower()
+        explicit = str(initial_headers.get("cf-mitigated", "")).lower() == "challenge"
+        browser_markers = (*CHALLENGE_MARKERS, "performing security verification", "checking your browser")
+        verification = explicit or any(marker in challenge_text for marker in browser_markers)
+        if verification and not action_reported:
+            action_reported = True
+            if callable(progress):
+                progress("BROWSER_ACTION_REQUIRED 浏览器出现网站验证，请在打开的 Edge 窗口中手动完成；程序会在验证后自动继续。")
+        if not verification and initial_status is not None:
+            details = {
+                **request_info,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "http_status": initial_status,
+                "kind": "forbidden" if initial_status == 403 else "unexpected_response",
+                "final_url": diagnostics.safe_url(session.page.url),
+            }
+            if callable(sink):
+                sink(details)
+            message = "invalid_discover_payload" if initial_status == 200 else f"http_{initial_status}"
+            raise CollectionError(message, **details)
+        if time.monotonic() >= deadline:
+            details = {
+                **request_info,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "http_status": initial_status,
+                "kind": "browser_verification_timeout" if verification else "unexpected_response",
+                "final_url": diagnostics.safe_url(session.page.url),
+            }
+            if verification and policy:
+                details["local_cooldown_seconds"] = session._challenge_cooldown_seconds
+                details["cooldown_source"] = "local_safety_policy"
+                details["retry_at"] = policy.defer(session._challenge_cooldown_seconds, reason="cloudflare_challenge")
+            if callable(sink):
+                sink(details)
+            message = "browser_verification_timeout" if verification else "invalid_discover_payload"
+            raise CollectionError(message, **details)
+        time.sleep(2)
+
+
 def write_json_atomic(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
@@ -437,12 +640,13 @@ def collect_urls(args, progress=print, transport=None):
     years = set(args.years or [])
     effective_sort = dict(parse_qsl(urlparse(build_query_url(args, 1)).query)).get("sort")
     owns_transport = transport is None
-    transport = transport or CollectionTransport(load_config(args.config))
+    transport = transport or CollectionTransport(load_config(args.config), request_mode=getattr(args, "request_mode", "http"))
     proxy_url = transport.proxy_url
     session = transport.acquire()
     session._collection_policy = RequestGate(args.delay_min, args.delay_max, progress)
     session._diagnostic_secrets = transport.secrets
     session._diagnostic_sink = lambda record: progress("REQUEST_DIAGNOSTIC " + json.dumps(record, ensure_ascii=False))
+    session._collection_progress = progress
     new_count = pages_done = 0
     old_pages = int(saved.get("old_pages", 0))
     last_success = int(saved.get("last_success_page", 0))
@@ -621,7 +825,10 @@ def collect_plan(plan_path, progress=print):
             merged[row["project_url"]] = row
     halted = False
     mode = plan.get("session_mode", "shared")
-    transport = CollectionTransport(load_config(next(iter(configs))), mode)
+    request_mode = plan.get("request_mode", "browser")
+    if request_mode not in ("http", "browser"):
+        raise ValueError("无效请求模式")
+    transport = CollectionTransport(load_config(next(iter(configs))), mode, request_mode=request_mode)
     progress("PLAN_SETTINGS " + json.dumps({
         "at": diagnostics.timestamp(),
         "batch_count": len(all_ids),
@@ -631,7 +838,9 @@ def collect_plan(plan_path, progress=print):
         "delay_min_seconds": request_settings.delay_min,
         "delay_max_seconds": request_settings.delay_max,
         "session_mode": mode,
-        "cookie_state_persistence": mode == "shared",
+        "request_mode": request_mode,
+        "cookie_state_persistence": mode == "shared" and request_mode == "http",
+        "browser_profile_persistence": request_mode == "browser",
         "challenge_cooldown_seconds": CHALLENGE_COOLDOWN_SECONDS,
         **diagnostics.network_context(transport.proxy_url),
     }, ensure_ascii=False))
@@ -660,7 +869,7 @@ def collect_plan(plan_path, progress=print):
             write_json_atomic(manifest_path, {"plan": str(plan_path), "batches": results, "total_urls": len(merged)})
     finally:
         transport.close()
-    summary = {"output": str(output), "manifest": str(manifest_path), "session_mode": mode, "total_urls": len(merged), "batches": results, "complete": all(x["complete"] for x in results), "selected_complete": all(x["complete"] for x in results if x["selected"]), "failed": any(x["executed"] and x["stop_reason"] == "request_failed" for x in results)}
+    summary = {"output": str(output), "manifest": str(manifest_path), "session_mode": mode, "request_mode": request_mode, "total_urls": len(merged), "batches": results, "complete": all(x["complete"] for x in results), "selected_complete": all(x["complete"] for x in results if x["selected"]), "failed": any(x["executed"] and x["stop_reason"] == "request_failed" for x in results)}
     write_json_atomic(manifest_path, summary)
     progress("PLAN_SUMMARY " + json.dumps(summary, ensure_ascii=False))
     return summary
@@ -684,6 +893,7 @@ def build_parser():
     parser.add_argument("--delay-max", type=float, default=15)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--request-mode", choices=("http", "browser"), default="http", help="browser 使用可见 Edge 和本机持久会话")
     parser.add_argument("--stop-after-old-pages", type=int, default=2)
     parser.add_argument("--output", default="candidate_urls.csv")
     parser.add_argument("--checkpoint")

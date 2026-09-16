@@ -2,7 +2,7 @@
 
 Python 编写的 Kickstarter 项目 URL 收集、项目元数据批量采集工具，附带本地 Web 控制台和 MySQL 存储支持。
 
-新版控制台支持地区、金额和筹款比例筛选，以及多状态分批采集、独立续跑和统一去重。G13 反馈修复增加了跨任务请求间隔、HTTP 错误分类和年份跳过统计，可继续使用上一版分批断点。最新版本进一步增加指定批次勾选、完整脱敏诊断下载、跨批次连接复用和跨任务站点 Cookie 延续；明确 Cloudflare 验证会启动本地冷却，已有汇总与断点保留。详见 [分批采集指南](GUIDE_BATCH_COLLECTION.md) 与 [内测记录](TEST_REPORT_COLLECTION.md)。
+新版控制台支持地区、金额和筹款比例筛选，以及多状态分批采集、独立续跑和统一去重。针对浏览器可以打开同一 JSON、直接 HTTP 请求却收到验证页的情况，控制台默认改用本机可见 Microsoft Edge：整轮复用专用浏览器配置，出现网站验证时等待用户在窗口中手动完成，然后从原断点继续。直接 HTTP 模式仍保留作诊断；请求间隔、失败停止、完整脱敏日志及 CSV 去重逻辑继续生效。详见 [分批采集指南](GUIDE_BATCH_COLLECTION.md) 与 [内测记录](TEST_REPORT_COLLECTION.md)。
 
 ## 本地运行（Windows PowerShell）
 

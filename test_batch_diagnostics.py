@@ -108,7 +108,7 @@ class SelectionTests(unittest.TestCase):
         self.temp.cleanup()
 
     def plan(self):
-        return web.make_plan({'output':'merged.csv','max_pages':1,'groups':[{'states':['successful'],'goal_min':i*100,'goal_max':(i+1)*100,'label':f'G{i+1}'} for i in range(3)]})
+        return web.make_plan({'output':'merged.csv','max_pages':1,'request_mode':'http','groups':[{'states':['successful'],'goal_min':i*100,'goal_max':(i+1)*100,'label':f'G{i+1}'} for i in range(3)]})
 
     def test_select_one_preserves_other_checkpoints_and_all_existing_urls(self):
         plan = self.plan()
@@ -185,7 +185,7 @@ class LocalSessionComparison(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp,patch.object(web,'ROOT',Path(tmp)),patch('url_collector.load_config',return_value={}),patch('url_collector.requests.Session.get',new=local_get),patch('request_control.RequestGate.before_request'):
                 for mode in ('shared','per_batch'):
                     observations.clear()
-                    plan=web.make_plan({'output':mode+'.csv','states':['successful','failed'],'max_pages':1,'session_mode':mode})
+                    plan=web.make_plan({'output':mode+'.csv','states':['successful','failed'],'max_pages':1,'session_mode':mode,'request_mode':'http'})
                     path=Path(tmp)/(mode+'.json');c.write_json_atomic(path,plan)
                     lines=[]
                     result=c.collect_plan(path,lines.append)

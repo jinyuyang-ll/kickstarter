@@ -157,7 +157,7 @@ class PlanTests(unittest.TestCase):
         self.temp.cleanup()
 
     def plan(self, **kwargs):
-        return web.make_plan({"output": "merged.csv", "max_pages": 1, "max_projects": 0, **kwargs})
+        return web.make_plan({"output": "merged.csv", "max_pages": 1, "max_projects": 0, "request_mode": "http", **kwargs})
 
     def test_states_split_and_duplicate_groups_deduped(self):
         group = {"category_id": 34, "states": ["successful", "failed"]}
