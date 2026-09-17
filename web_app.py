@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import url_collector as collector
+from work_order_queue import QueueWorker, WorkOrderStore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -29,6 +30,8 @@ LOCATION_LOCK = threading.Lock()
 LOCATION_CACHE = {}
 LAST_LOCATION_REQUEST = 0.0
 ALLOWED_SCRIPTS = {"collect": "url_collector.py", "import": "url_importer.py", "batch": "metadata_batch_spider.py", "smoke": "smoke_test.py", "proxy": "proxy_probe.py"}
+ORDER_STORE = WorkOrderStore(ROOT / ".collection" / "work_orders.sqlite3")
+ORDER_WORKER = QueueWorker(ORDER_STORE, ROOT)
 
 
 def safe_workspace_file(value, suffixes=None):
@@ -42,6 +45,10 @@ def safe_workspace_file(value, suffixes=None):
 
 def public_job(job):
     return {k: v for k, v in job.items() if k not in ("process", "log_path")}
+
+
+def public_order(order):
+    return {k: v for k, v in order.items() if k not in ("plan_path", "log_path")} if order else None
 
 
 def run_job(job_id, command):
@@ -219,6 +226,49 @@ def cached_locations(term):
         return result
 
 
+
+def work_order_spec(data, plan):
+    safe_pages = max(1, min(200, int(data.get("safe_pages", 180))))
+    metadata_limit = max(0, min(1000000, int(data.get("metadata_limit") or 0)))
+    excel_default = Path(plan["output"]).with_suffix(".xlsx")
+    excel_output = safe_workspace_file(data.get("excel_output") or str(excel_default), {".xlsx"})
+    repeat_hours = float(data.get("repeat_hours") or 0)
+    if not math.isfinite(repeat_hours) or repeat_hours < 0:
+        raise ValueError("重跑间隔必须是非负数")
+    schedule = data.get("schedule_at")
+    next_run_at = time.time()
+    if schedule:
+        try:
+            next_run_at = time.mktime(time.strptime(str(schedule)[:16], "%Y-%m-%dT%H:%M"))
+        except ValueError as exc:
+            raise ValueError("定时启动格式无效") from exc
+    spec = {
+        "auto_split": bool(data.get("auto_split", True)),
+        "safe_pages": safe_pages,
+        "run_metadata": bool(data.get("run_metadata", False)),
+        "metadata_limit": metadata_limit,
+        "metadata_year": int(data["metadata_year"]) if data.get("metadata_year") else None,
+        "excel_output": str(excel_output),
+    }
+    return spec, next_run_at, repeat_hours
+
+
+def create_work_order(data):
+    plan = make_plan(data)
+    directory = ROOT / ".collection" / "work_order_plans"
+    directory.mkdir(parents=True, exist_ok=True)
+    plan_path = directory / (uuid.uuid4().hex + ".json")
+    collector.write_json_atomic(plan_path, plan)
+    spec, next_run_at, repeat_hours = work_order_spec(data, plan)
+    return ORDER_STORE.create(
+        data.get("work_order_title") or Path(plan["output"]).stem,
+        spec,
+        plan_path,
+        next_run_at,
+        repeat_hours,
+        max(1, min(10000, int(data.get("max_attempts") or 100))),
+    )
+
 def import_args(data):
     path = safe_workspace_file(data.get("file") or "candidate_urls.csv", {".csv", ".txt", ".json"})
     args = [str(path)]
@@ -255,6 +305,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/work-orders":
+            self.send_json([public_order(item) for item in ORDER_STORE.list()])
+            return
+        if parsed.path.startswith("/api/work-orders/") and parsed.path.endswith("/log"):
+            identity = parsed.path.split("/")[-2]
+            order = ORDER_STORE.get(identity)
+            if not order:
+                self.send_json({"error": "工单不存在"}, 404)
+                return
+            path = Path(order["log_path"])
+            if not path.is_file():
+                self.send_json({"error": "工单日志尚未生成"}, 404)
+                return
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="work-order-{identity}.txt"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path.startswith("/api/work-orders/"):
+            identity = parsed.path.rsplit("/", 1)[-1]
+            order = ORDER_STORE.get(identity)
+            self.send_json(public_order(order) if order else {"error": "工单不存在"}, 200 if order else 404)
+            return
         if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/diagnostics"):
             identity = parsed.path.split("/")[-2]
             if not identity or any(char not in "0123456789abcdef" for char in identity) or len(identity) != 10:
@@ -284,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
             files = []
             for pattern in ("*.csv", "*.txt", "*.json"):
                 files.extend({"name": p.name, "size": p.stat().st_size, "modified": int(p.stat().st_mtime)} for p in ROOT.glob(pattern) if p.name != "config.json")
-            self.send_json({"ok": True, "python": sys.version.split()[0], "root": str(ROOT), "files": sorted(files, key=lambda x: x["modified"], reverse=True)[:50]})
+            self.send_json({"ok": True, "python": sys.version.split()[0], "root": str(ROOT), "queue_worker": "running" if ORDER_WORKER.thread and ORDER_WORKER.thread.is_alive() else "stopped", "active_work_order": ORDER_WORKER.active_id, "files": sorted(files, key=lambda x: x["modified"], reverse=True)[:50]})
             return
         if parsed.path == "/api/jobs":
             with LOCK:
@@ -316,6 +393,13 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/plan/preview":
                 self.send_json(make_plan(data))
                 return
+            if route == "/api/work-orders":
+                self.send_json(public_order(create_work_order(data)), HTTPStatus.ACCEPTED)
+                return
+            if route.startswith("/api/work-orders/") and route.count("/") == 3:
+                identity = route.split("/")[3]
+                self.send_json(public_order(ORDER_STORE.action(identity, str(data.get("action") or ""))))
+                return
             if route == "/api/jobs/collect":
                 plan = make_plan(data)
                 path = ROOT / ".collection" / (uuid.uuid4().hex + ".json")
@@ -346,6 +430,7 @@ def main():
     if args.host not in ("127.0.0.1", "localhost"):
         print("警告：界面包含任务执行能力，默认只应绑定本机 127.0.0.1。", file=sys.stderr)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    ORDER_WORKER.start()
     url = f"http://{args.host}:{args.port}"
     print(f"Kickstarter 控制台已启动: {url}", flush=True)
     if not args.no_browser:
@@ -355,6 +440,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        ORDER_WORKER.stop()
         server.server_close()
     return 0
 

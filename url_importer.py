@@ -62,32 +62,15 @@ def extract_urls(path):
         yield line
 
 
-def main():
-    parser = argparse.ArgumentParser(description="导入 Kickstarter 项目 URL")
-    parser.add_argument("file")
-    parser.add_argument("--config", default="config.json")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-
-    path = Path(args.file)
+def import_urls(path, config_path="config.json", dry_run=False):
+    path = Path(path)
     unique_urls = sorted(
         {url for value in extract_urls(path) if (url := normalize_url(value))}
     )
-    print(f"有效且去重后的 URL: {len(unique_urls)}")
-    if args.dry_run:
-        for url in unique_urls:
-            print(url)
-        return 0
-    if not unique_urls:
-        return 0
-
-    config = load_config(args.config)
-    try:
-        db = connect_db(config)
-    except Exception as exc:
-        print(f"数据库连接失败: {exc}", file=sys.stderr)
-        return 3
-
+    result = {"valid_urls": len(unique_urls), "inserted": 0, "existing": 0}
+    if dry_run or not unique_urls:
+        return result
+    db = connect_db(load_config(config_path))
     try:
         with db.cursor() as cursor:
             affected = cursor.executemany(
@@ -98,10 +81,34 @@ def main():
                 [(url,) for url in unique_urls],
             )
         db.commit()
-        print(f"新增任务: {affected}；已存在或忽略: {len(unique_urls) - affected}")
-        return 0
+        result.update(inserted=affected, existing=len(unique_urls) - affected)
+        return result
     finally:
         db.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="导入 Kickstarter 项目 URL")
+    parser.add_argument("file")
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    path = Path(args.file)
+    if args.dry_run:
+        values = sorted({url for value in extract_urls(path) if (url := normalize_url(value))})
+        print(f"有效且去重后的 URL: {len(values)}")
+        for url in values:
+            print(url)
+        return 0
+    try:
+        result = import_urls(path, args.config)
+    except Exception as exc:
+        print(f"数据库连接或导入失败: {exc}", file=sys.stderr)
+        return 3
+    print(f"有效且去重后的 URL: {result['valid_urls']}")
+    print(f"新增任务: {result['inserted']}；已存在或忽略: {result['existing']}")
+    return 0
 
 
 if __name__ == "__main__":

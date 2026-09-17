@@ -8,6 +8,7 @@ import sys
 import time
 
 import pymysql
+from curl_cffi import requests
 
 from project_metadata_spider import build_proxy_url, collect
 
@@ -359,6 +360,7 @@ def run(args):
         print(f"数据库连接失败: {exc}", file=sys.stderr)
         return 3
 
+    shared_session = None
     try:
         if args.init_schema:
             execute_schema(db, args.schema)
@@ -371,6 +373,7 @@ def run(args):
         succeeded = 0
         filtered = 0
         failed = 0
+        shared_session = requests.Session()
         while processed < args.limit:
             task = claim_task(db)
             if not task:
@@ -388,6 +391,7 @@ def run(args):
                     task["project_url"],
                     proxy_url=proxy_url,
                     required_year=args.year,
+                    session=shared_session,
                 )
                 if result.get("filtered_year"):
                     actual_year = result.get("actual_year")
@@ -409,9 +413,12 @@ def run(args):
                     f"任务失败: status={status} retry_at={retry_at} error={exc}",
                     file=sys.stderr,
                 )
+                if "security_challenge" in str(exc):
+                    print("检测到验证，停止本轮后续元数据任务", file=sys.stderr)
+                    break
 
             if processed < args.limit:
-                delay = random.uniform(*NORMAL_DELAY_RANGE)
+                delay = random.uniform(args.delay_min, args.delay_max)
                 print(f"等待 {delay:.1f} 秒", file=sys.stderr)
                 time.sleep(delay)
 
@@ -428,6 +435,8 @@ def run(args):
         )
         return 2 if failed else 0
     finally:
+        if shared_session is not None:
+            shared_session.close()
         db.close()
 
 
@@ -438,11 +447,15 @@ def main():
     parser.add_argument("--init-schema", action="store_true")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--year", type=int, help="只入库指定开始年份的项目")
+    parser.add_argument("--delay-min", type=float, default=NORMAL_DELAY_RANGE[0])
+    parser.add_argument("--delay-max", type=float, default=NORMAL_DELAY_RANGE[1])
     parser.add_argument(
         "--url", action="append", default=[], help="直接加入一个项目 URL，可重复"
     )
     args = parser.parse_args()
     args.limit = max(1, args.limit)
+    args.delay_min = max(0, args.delay_min)
+    args.delay_max = max(args.delay_min, args.delay_max)
     return run(args)
 
 

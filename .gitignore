@@ -26,6 +26,7 @@ __pycache__/
 # Generated documents, previews, archives and run output
 *.zip
 *.docx
+*.xlsx
 docx_render/
 generic_proxy_doc_render/
 proxy_doc_render/

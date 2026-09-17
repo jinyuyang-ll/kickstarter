@@ -102,6 +102,10 @@ def request_with_retry(session, method, url, **kwargs):
             last_error = (
                 "security_challenge" if challenged else f"http_{response.status_code}"
             )
+            if challenged:
+                raise RuntimeError(last_error)
+        except RuntimeError:
+            raise
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
 
@@ -203,8 +207,8 @@ def normalize_project(project, page_url):
     }
 
 
-def collect(project_url, proxy_url=None, required_year=None):
-    session = requests.Session()
+def collect(project_url, proxy_url=None, required_year=None, session=None):
+    session = session or requests.Session()
     proxies = (
         {"http": proxy_url, "https": proxy_url}
         if proxy_url

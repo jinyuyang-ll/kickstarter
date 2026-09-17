@@ -2,7 +2,7 @@
 
 Python 编写的 Kickstarter 项目 URL 收集、项目元数据批量采集工具，附带本地 Web 控制台和 MySQL 存储支持。
 
-新版控制台支持地区、金额和筹款比例筛选，以及多状态分批采集、独立续跑和统一去重。针对浏览器可以打开同一 JSON、直接 HTTP 请求却收到验证页的情况，控制台默认改用本机可见 Microsoft Edge：整轮复用专用浏览器配置，出现网站验证时等待用户在窗口中手动完成，然后从原断点继续。直接 HTTP 模式仍保留作诊断；请求间隔、失败停止、完整脱敏日志及 CSV 去重逻辑继续生效。详见 [分批采集指南](GUIDE_BATCH_COLLECTION.md) 与 [内测记录](TEST_REPORT_COLLECTION.md)。
+新版控制台已形成持久化工单系统：一个工单可绑定多个查询批次，多个工单串行排队，支持指定时间启动、未完成任务按小时重跑和重启恢复。系统可预检 `total_hits`，对预计超过安全页数的目标金额、已筹金额或筹款比例区间自动拆分；URL完成后可自动入库、采集元数据并输出Excel。URL阶段默认使用可见Microsoft Edge，出现网站验证时等待人工处理。详见 [工单与全流程指南](GUIDE_WORK_ORDERS.md)、[分批采集指南](GUIDE_BATCH_COLLECTION.md) 与 [内测记录](TEST_REPORT_COLLECTION.md)。
 
 ## 本地运行（Windows PowerShell）
 
@@ -38,7 +38,9 @@ docker compose -f docker-compose.metadata.yml up -d --wait
 ## 文件说明
 
 - `web_app.py`、`web/index.html`：本地控制台。
-- `url_collector.py`、`url_importer.py`：收集和导入项目 URL。
+- `url_collector.py`、`adaptive_planner.py`、`url_importer.py`：收集、自动拆分和导入项目URL。
+- `work_order_queue.py`、`pipeline_runner.py`：持久工单队列和全流程执行。
+- `excel_exporter.py`：导出URL、批次和元数据Excel工作簿。
 - `project_metadata_spider.py`、`metadata_batch_spider.py`：项目元数据采集。
 - `*_spider.py`、`download_video.py`：其他项目内容采集和视频下载脚本。
 - `metadata_schema.sql`、`docker-compose.metadata.yml`：数据库结构和本地 MySQL 服务。
