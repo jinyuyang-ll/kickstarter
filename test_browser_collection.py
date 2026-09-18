@@ -54,6 +54,41 @@ class BrowserModeTests(unittest.TestCase):
         self.assertEqual(record["request_mode"], "browser")
         self.assertNotIn("profile_path", record)
 
+    def test_browser_internal_error_page_fails_immediately(self):
+        session = Mock()
+        session._collection_policy = None
+        session._diagnostic_sink = Mock()
+        session._collection_progress = Mock()
+        session._diagnostic_session_id = "browser-error"
+        session.proxy_url = None
+        session.verification_timeout = 300
+        session.page.goto.side_effect = RuntimeError("navigation failed")
+        session.page.is_closed.return_value = False
+        session.page.url = "chrome-error://chromewebdata/"
+
+        with self.assertRaises(c.CollectionError) as caught:
+            c.request_browser_page(session, c.BASE_URL, 1)
+
+        self.assertEqual(str(caught.exception), "browser_navigation_error")
+        self.assertEqual(caught.exception.details["kind"], "browser_navigation_error")
+        session.page.locator.assert_not_called()
+    def test_browser_internal_error_after_navigation_fails_immediately(self):
+        session = Mock()
+        session._collection_policy = None
+        session._diagnostic_sink = Mock()
+        session._collection_progress = Mock()
+        session._diagnostic_session_id = "browser-error-after-navigation"
+        session.proxy_url = None
+        session.verification_timeout = 300
+        session.page.goto.return_value = None
+        session.page.url = "chrome-error://chromewebdata/"
+
+        with self.assertRaises(c.CollectionError) as caught:
+            c.request_browser_page(session, c.BASE_URL, 1)
+
+        self.assertEqual(str(caught.exception), "browser_navigation_error")
+        self.assertEqual(caught.exception.details["kind"], "browser_navigation_error")
+        session.page.locator.assert_not_called()
     def test_challenge_prompts_once_then_continues_after_user_verification(self):
         payload = {"projects": [], "has_more": False}
         session = Mock()

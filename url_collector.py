@@ -73,6 +73,7 @@ ERROR_LABELS = {
     "challenge_cooldown_active": "Cloudflare 验证冷却中，本次未发送请求",
     "browser_verification_timeout": "浏览器验证等待超时，进度已保存",
     "browser_closed": "浏览器窗口已关闭，进度已保存",
+    "browser_navigation_error": "\u6d4f\u89c8\u5668\u5bfc\u822a\u5931\u8d25\uff0c\u8fdb\u5ea6\u5df2\u4fdd\u5b58",
 }
 
 
@@ -544,11 +545,36 @@ def request_browser_page(session, url, timeout):
             if callable(sink):
                 sink(details)
             raise CollectionError("browser_closed", **details) from exc
+        current_url = str(getattr(session.page, "url", "") or "").lower()
+        if current_url.startswith(("chrome-error://", "edge-error://")):
+            details = {
+                **request_info,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "http_status": None,
+                "kind": "browser_navigation_error",
+                "final_url": diagnostics.safe_url(current_url),
+                "exception_type": type(exc).__name__,
+            }
+            if callable(sink):
+                sink(details)
+            raise CollectionError("browser_navigation_error", **details) from exc
     initial_status = response.status if response is not None else None
     initial_headers = response.headers if response is not None else {}
     deadline = time.monotonic() + session.verification_timeout
     action_reported = False
     while True:
+        current_url = str(getattr(session.page, "url", "") or "").lower()
+        if current_url.startswith(("chrome-error://", "edge-error://")):
+            details = {
+                **request_info,
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "http_status": initial_status,
+                "kind": "browser_navigation_error",
+                "final_url": diagnostics.safe_url(current_url),
+            }
+            if callable(sink):
+                sink(details)
+            raise CollectionError("browser_navigation_error", **details)
         try:
             rendered_text = session.page.locator("body").inner_text(timeout=2000)
         except Exception as exc:

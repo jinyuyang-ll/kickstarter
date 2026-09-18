@@ -272,5 +272,3 @@ class QueueWorker:
             self.process = None
             self.active_id = None
             self.store.finish(order["id"], exit_code, summary, error)
-
-\n
